@@ -137,6 +137,18 @@ async function handleMessage(ws: SocketClient, raw: string) {
         send(ws, 'confirm:opened', await gameManager.proposePlay(id, pid, normalized));
         break;
       }
+      case 'game:livePlay': {
+        const selected =
+          payload.selectedSquare && typeof payload.selectedSquare === 'object'
+            ? (payload.selectedSquare as { row: number; col: number })
+            : null;
+        await gameManager.updateLivePlay(id, pid, {
+          placements: Array.isArray(payload.placements) ? (payload.placements as any[]) : [],
+          selectedSquare: selected,
+          playDirection: payload.playDirection === 'down' ? 'down' : 'across',
+        });
+        break;
+      }
       case 'game:exchange':
         send(
           ws,

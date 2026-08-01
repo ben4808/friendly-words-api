@@ -50,6 +50,14 @@ export const drawTiles = (
   return { tiles, remainingPool };
 };
 
+/** Serialize rack letters alphabetically, with blanks (`?`) last. */
 export const serializeRack = (rack: FriendlyWordsTile[]): string => {
-  return rack.map((tile) => (tile.letter === '' ? '?' : tile.letter)).join('');
+  return rack
+    .map((tile) => (tile.letter === '' ? '?' : tile.letter.toUpperCase()))
+    .sort((a, b) => {
+      if (a === '?') return 1;
+      if (b === '?') return -1;
+      return a.localeCompare(b);
+    })
+    .join('');
 };

@@ -3,13 +3,16 @@ import {
   FriendlyWordsConfirmation,
   FriendlyWordsGame,
   FriendlyWordsGameState,
+  FriendlyWordsLivePlay,
   FriendlyWordsPlacement,
   FriendlyWordsPlayer,
   FriendlyWordsPlayedWord,
+  FriendlyWordsRating,
   FriendlyWordsRatingLabel,
   FriendlyWordsTurn,
 } from 'cruzi-models';
 import { BOARD_SIZE, BINGO_BONUS, MAX_PLAYERS, RACK_SIZE } from './constants';
+import { findPrincipalWord, formatExchangeAction, formatPlayAction } from './notation';
 import { applyPlacementsToBoard, validatePlayGeometry } from './scoring';
 import { createTilePool, drawTiles, getTileValue, serializeRack } from './tileUtils';
 import {
@@ -21,9 +24,11 @@ import {
 } from '../lib/ids';
 import {
   DEFAULT_RATING_LABEL,
+  ensureOpponentRating,
   getRatingMultiplier,
   isRatingLabel,
   productOfMultipliers,
+  recomputeConfirmationConsensus,
 } from '../lib/ratings';
 
 export class GameError extends Error {
@@ -57,6 +62,7 @@ export type PublicGameView = {
   board: FriendlyWordsGameState['board'];
   gamePhase: FriendlyWordsGameState['gamePhase'];
   confirmation: FriendlyWordsConfirmation | null;
+  livePlay?: FriendlyWordsLivePlay | null;
   winnerPlayerId: string | null | undefined;
   myRack?: FriendlyWordsGameState['tilePool'];
   me?: PublicPlayer & { token?: string };
@@ -80,6 +86,8 @@ const toPublicPlayer = (player: FriendlyWordsPlayer): PublicPlayer => ({
 export class GameManager {
   private dao = new CruziDao();
   private cache = new Map<string, FriendlyWordsGame>();
+  /** Ephemeral turn previews — not persisted. */
+  private livePlays = new Map<string, FriendlyWordsLivePlay>();
   private broadcast: BroadcastFn = () => undefined;
   private sendToPlayer: SendToPlayerFn = () => undefined;
 
@@ -167,6 +175,7 @@ export class GameManager {
       board: game.state.board,
       gamePhase: game.state.gamePhase,
       confirmation: game.state.confirmation,
+      livePlay: this.livePlays.get(game.id) ?? null,
       winnerPlayerId: game.state.winnerPlayerId,
     };
 
@@ -188,6 +197,15 @@ export class GameManager {
   private emitGame(game: FriendlyWordsGame, event = 'game:state') {
     for (const player of [...game.state.players, ...game.state.waitlist]) {
       this.sendToPlayer(game.id, player.id, event, this.toPublicView(game, player.id));
+    }
+  }
+
+  private emitRejected(game: FriendlyWordsGame, message: string) {
+    for (const player of [...game.state.players, ...game.state.waitlist]) {
+      this.sendToPlayer(game.id, player.id, 'confirm:rejected', {
+        message,
+        game: this.toPublicView(game, player.id),
+      });
     }
   }
 
@@ -430,9 +448,100 @@ export class GameManager {
     game.state.winnerPlayerId = null;
     game.status = 'playing';
 
+    this.clearLivePlay(game.id, false);
     await this.persist(game);
     this.emitGame(game, 'game:started');
     return this.toPublicView(game, hostPlayerId);
+  }
+
+  private clearLivePlay(gameId: string, notify = true) {
+    if (!this.livePlays.has(gameId)) {
+      if (notify) this.broadcast(gameId, 'game:livePlay', null);
+      return;
+    }
+    this.livePlays.delete(gameId);
+    if (notify) this.broadcast(gameId, 'game:livePlay', null);
+  }
+
+  /**
+   * Broadcast the current player's in-progress selection/placements to all clients.
+   * Ephemeral — not persisted.
+   */
+  async updateLivePlay(
+    gameId: string,
+    playerId: string,
+    update: {
+      placements?: FriendlyWordsPlacement[];
+      selectedSquare?: { row: number; col: number } | null;
+      playDirection?: 'across' | 'down';
+    }
+  ): Promise<FriendlyWordsLivePlay | null> {
+    const game = await this.loadGame(gameId);
+    if (game.status !== 'playing') throw new GameError('Game is not in progress');
+    if (game.state.gamePhase !== 'playing') throw new GameError('Cannot preview during confirmation');
+
+    const currentId = game.state.turnOrder[game.state.currentPlayerIndex];
+    if (currentId !== playerId) throw new GameError('Not your turn');
+
+    const player = this.requireSeated(game, playerId);
+    const rawPlacements = Array.isArray(update.placements) ? update.placements : [];
+    const placements: FriendlyWordsPlacement[] = rawPlacements.map((p) => ({
+      row: Number(p.row),
+      col: Number(p.col),
+      letter: String(p.letter || '').toUpperCase(),
+      value: Number(p.value),
+      isBlank: Boolean(p.isBlank) || String(p.letter || '') === '',
+    }));
+
+    for (const placement of placements) {
+      if (
+        placement.row < 0 ||
+        placement.col < 0 ||
+        placement.row >= BOARD_SIZE ||
+        placement.col >= BOARD_SIZE
+      ) {
+        throw new GameError('Placement out of bounds');
+      }
+      if (game.state.board[placement.row][placement.col]) {
+        throw new GameError('Square already occupied');
+      }
+    }
+    if (placements.length > 0) {
+      this.assertPlacementsFromRack(player, placements);
+    }
+
+    let selectedSquare: { row: number; col: number } | null = null;
+    if (update.selectedSquare && typeof update.selectedSquare === 'object') {
+      const row = Number(update.selectedSquare.row);
+      const col = Number(update.selectedSquare.col);
+      if (
+        Number.isFinite(row) &&
+        Number.isFinite(col) &&
+        row >= 0 &&
+        col >= 0 &&
+        row < BOARD_SIZE &&
+        col < BOARD_SIZE
+      ) {
+        selectedSquare = { row, col };
+      }
+    }
+
+    const playDirection = update.playDirection === 'down' ? 'down' : 'across';
+
+    if (!selectedSquare && placements.length === 0) {
+      this.clearLivePlay(gameId, true);
+      return null;
+    }
+
+    const livePlay: FriendlyWordsLivePlay = {
+      playerId,
+      placements,
+      selectedSquare,
+      playDirection,
+    };
+    this.livePlays.set(gameId, livePlay);
+    this.broadcast(gameId, 'game:livePlay', livePlay);
+    return livePlay;
   }
 
   async proposePlay(
@@ -454,31 +563,45 @@ export class GameManager {
     const geometry = validatePlayGeometry(game.state.board, placements);
     if (!geometry.isValid) throw new GameError(geometry.invalidReason || 'Invalid play');
 
-    let grossScore = geometry.grossScore;
-    if (placements.length === RACK_SIZE) grossScore += BINGO_BONUS;
+    const principal = findPrincipalWord(game.state.board, placements, geometry.words);
+    const isBingo = placements.length === RACK_SIZE;
 
-    const words = geometry.words.map((word) => ({
-      id: generateEntityId(),
-      entry: word.entry,
-      direction: word.direction,
-      startRow: word.startRow,
-      startCol: word.startCol,
-      grossScore: word.grossScore,
-      ratingLabel: DEFAULT_RATING_LABEL,
-      multiplier: getRatingMultiplier(DEFAULT_RATING_LABEL),
-      wasUpdated: false,
-    }));
+    const entryTexts = geometry.words.map((w) => w.entry);
+    const recommendations = await this.dao.recommendFriendlyWordsRatings(entryTexts);
+
+    const words = geometry.words.map((word) => {
+      const recommendedRaw = recommendations[word.entry];
+      const recommendedLabel = isRatingLabel(recommendedRaw)
+        ? recommendedRaw
+        : DEFAULT_RATING_LABEL;
+      const isPrincipal =
+        word.startRow === principal.startRow &&
+        word.startCol === principal.startCol &&
+        word.direction === principal.direction;
+      const grossScore = word.grossScore + (isBingo && isPrincipal ? BINGO_BONUS : 0);
+      return {
+        id: generateEntityId(),
+        entry: word.entry,
+        direction: word.direction,
+        startRow: word.startRow,
+        startCol: word.startCol,
+        grossScore,
+        recommendedLabel,
+        opponentRatings: {},
+        ratingLabel: recommendedLabel,
+        multiplier: getRatingMultiplier(recommendedLabel),
+      };
+    });
 
     const totalMultiplier = productOfMultipliers(words.map((w) => w.multiplier));
-    const bingoPortion = placements.length === RACK_SIZE ? BINGO_BONUS : 0;
-    const wordGross = geometry.grossScore;
-    const netScore = Math.round(wordGross * totalMultiplier) + bingoPortion;
+    const wordGross = words.reduce((sum, w) => sum + w.grossScore, 0);
+    const netScore = Math.round(wordGross * totalMultiplier);
 
     game.state.confirmation = {
       playerId,
       placements,
       words,
-      grossScore,
+      grossScore: wordGross,
       totalMultiplier,
       netScore,
       confirmedBy: [],
@@ -486,6 +609,7 @@ export class GameManager {
     };
     game.state.gamePhase = 'confirming';
 
+    this.clearLivePlay(gameId, false);
     await this.persist(game);
     this.emitGame(game, 'confirm:opened');
     return this.toPublicView(game, playerId);
@@ -510,6 +634,10 @@ export class GameManager {
     }
   }
 
+  private opponentIds(game: FriendlyWordsGame, confirmationPlayerId: string): string[] {
+    return game.state.players.map((p) => p.id).filter((id) => id !== confirmationPlayerId);
+  }
+
   async rateWord(
     gameId: string,
     playerId: string,
@@ -521,29 +649,25 @@ export class GameManager {
     if (game.state.gamePhase !== 'confirming' || !game.state.confirmation) {
       throw new GameError('No play is awaiting confirmation');
     }
+    const confirmation = game.state.confirmation;
+    if (confirmation.playerId === playerId) {
+      throw new GameError('The player on turn cannot rate words');
+    }
     if (!isRatingLabel(ratingLabel)) throw new GameError('Invalid rating');
 
-    const word = game.state.confirmation.words.find((w) => w.id === wordId);
+    const word = confirmation.words.find((w) => w.id === wordId);
     if (!word) throw new GameError('Word not found');
 
     const label = ratingLabel as FriendlyWordsRatingLabel;
-    if (word.ratingLabel !== label) {
-      word.ratingLabel = label;
-      word.multiplier = getRatingMultiplier(label);
-      word.wasUpdated = true;
-    }
+    word.opponentRatings[playerId] = {
+      ratingLabel: label,
+      wasUpdated: label !== word.recommendedLabel,
+    };
 
-    const bingoPortion =
-      game.state.confirmation.placements.length === RACK_SIZE ? BINGO_BONUS : 0;
-    const wordGross = game.state.confirmation.words.reduce((sum, w) => sum + w.grossScore, 0);
-    // grossScore on confirmation includes bingo; strip for multiplier product
-    game.state.confirmation.totalMultiplier = productOfMultipliers(
-      game.state.confirmation.words.map((w) => w.multiplier)
-    );
-    game.state.confirmation.netScore =
-      Math.round(wordGross * game.state.confirmation.totalMultiplier) + bingoPortion;
-    game.state.confirmation.confirmedBy = [];
-    game.state.confirmation.version += 1;
+    // Changing a rating clears this opponent's confirmation
+    confirmation.confirmedBy = confirmation.confirmedBy.filter((id) => id !== playerId);
+    recomputeConfirmationConsensus(confirmation);
+    confirmation.version += 1;
 
     await this.persist(game);
     this.emitGame(game, 'confirm:updated');
@@ -558,15 +682,38 @@ export class GameManager {
     }
 
     const confirmation = game.state.confirmation;
+    if (confirmation.playerId === playerId) {
+      throw new GameError('The player on turn does not confirm — opponents do');
+    }
+
+    // Ensure this opponent has a rating recorded for every word (defaults to recommended)
+    for (const word of confirmation.words) {
+      ensureOpponentRating(word, playerId);
+    }
+
     if (!confirmation.confirmedBy.includes(playerId)) {
       confirmation.confirmedBy.push(playerId);
     }
 
-    const seatedIds = game.state.players.map((p) => p.id);
-    const allConfirmed = seatedIds.every((id) => confirmation.confirmedBy.includes(id));
-    if (!allConfirmed) {
+    recomputeConfirmationConsensus(confirmation);
+    confirmation.version += 1;
+
+    const opponents = this.opponentIds(game, confirmation.playerId);
+    const allOpponentsConfirmed =
+      opponents.length === 0 ||
+      opponents.every((id) => confirmation.confirmedBy.includes(id));
+
+    if (!allOpponentsConfirmed) {
       await this.persist(game);
       this.emitGame(game, 'confirm:updated');
+      return this.toPublicView(game, playerId);
+    }
+
+    if (confirmation.netScore <= 0) {
+      game.state.confirmation = null;
+      game.state.gamePhase = 'playing';
+      await this.persist(game);
+      this.emitRejected(game, '0 points scored, please try again');
       return this.toPublicView(game, playerId);
     }
 
@@ -603,6 +750,9 @@ export class GameManager {
 
     this.assertPlacementsFromRack(player, confirmation.placements);
 
+    const rackAtStart = serializeRack(player.rack);
+    const action = formatPlayAction(game.state.board, confirmation.placements);
+
     // Remove used tiles from rack
     for (const placement of confirmation.placements) {
       const isBlank = Boolean(placement.isBlank) || placement.letter === '';
@@ -629,8 +779,8 @@ export class GameManager {
       gameId: game.id,
       player: player.name,
       turnNumber: game.state.turnNumber,
-      rack: serializeRack(player.rack),
-      action: 'play',
+      rack: rackAtStart,
+      action,
       grossScore: confirmation.grossScore,
       totalMultiplier: String(confirmation.totalMultiplier),
       netScore: confirmation.netScore,
@@ -644,11 +794,28 @@ export class GameManager {
       entry: word.entry,
       lang: 'en',
       grossScore: word.grossScore,
-      multiplier: word.ratingLabel,
-      wasUpdated: word.wasUpdated,
+      multiplier: String(word.multiplier),
     }));
 
     await this.dao.submitFriendlyWordsTurn(turn, playedWords);
+
+    const ratings: FriendlyWordsRating[] = [];
+    for (const word of confirmation.words) {
+      for (const opponentId of confirmation.confirmedBy) {
+        const rating = word.opponentRatings[opponentId];
+        if (!rating) continue;
+        ratings.push({
+          playedWordId: word.id,
+          playerId: opponentId,
+          entry: word.entry,
+          lang: 'en',
+          multiplier: String(getRatingMultiplier(rating.ratingLabel)),
+          wasUpdated: rating.wasUpdated,
+        });
+      }
+    }
+    await this.dao.addFriendlyWordsRatings(ratings);
+
     game.turns = [...(game.turns || []), turn];
     game.playedWords = [...(game.playedWords || []), ...playedWords];
 
@@ -667,6 +834,7 @@ export class GameManager {
       game.state.gamePhase = 'playing';
     }
 
+    this.clearLivePlay(game.id, false);
     await this.persist(game);
   }
 
@@ -693,7 +861,9 @@ export class GameManager {
     }
 
     const startScore = player.score;
+    const rackAtStart = serializeRack(player.rack);
     const exchanged = uniqueIndices.map((i) => player.rack[i]);
+    const action = formatExchangeAction(exchanged);
     for (const i of uniqueIndices) player.rack.splice(i, 1);
 
     const drawn = drawTiles(game.state.tilePool, exchanged.length);
@@ -710,8 +880,8 @@ export class GameManager {
       gameId: game.id,
       player: player.name,
       turnNumber: game.state.turnNumber,
-      rack: serializeRack(player.rack),
-      action: 'exchange',
+      rack: rackAtStart,
+      action,
       grossScore: 0,
       totalMultiplier: '1',
       netScore: 0,
@@ -726,6 +896,7 @@ export class GameManager {
       (game.state.currentPlayerIndex + 1) % game.state.turnOrder.length;
     game.state.gamePhase = 'playing';
 
+    this.clearLivePlay(gameId, false);
     await this.persist(game);
     this.emitGame(game, 'game:state');
     return this.toPublicView(game, playerId);
@@ -752,12 +923,14 @@ export class GameManager {
     game.state.gamePhase = 'gameOver';
     game.status = 'completed';
     game.completedAt = new Date();
-    void this.dao.completeFriendlyWordsGame(game.id);
   }
 
   async returnToLobby(gameId: string, playerId: string): Promise<PublicGameView> {
     const game = await this.loadGame(gameId);
     this.requireHost(game, playerId);
+    if (game.status === 'completed' || game.state.gamePhase === 'gameOver') {
+      throw new GameError('Completed games cannot return to the lobby', 400);
+    }
 
     for (const player of game.state.players) {
       player.ready = false;
@@ -776,6 +949,7 @@ export class GameManager {
     game.state.confirmation = null;
     game.state.winnerPlayerId = null;
 
+    this.clearLivePlay(gameId, false);
     await this.persist(game);
     this.emitGame(game, 'lobby:updated');
     return this.toPublicView(game, playerId);
