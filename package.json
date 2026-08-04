@@ -7,7 +7,10 @@
     "dev": "nodemon src/index.ts",
     "prebuild": "npm run build --prefix ../cruzi-models && npm run build --prefix ../cruzi-db",
     "build": "tsc",
-    "watch": "tsc --watch"
+    "watch": "tsc --watch",
+    "docker:build": "docker buildx build --build-context cruzi-models=../cruzi-models --build-context cruzi-db=../cruzi-db -t friendly-words:latest .",
+    "docker:up": "docker compose up --build -d",
+    "docker:down": "docker compose down"
   },
   "dependencies": {
     "cors": "^2.8.5",

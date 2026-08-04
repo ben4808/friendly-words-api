@@ -8,9 +8,10 @@ function param(value: string | string[]): string {
   return Array.isArray(value) ? value[0] : value;
 }
 
-export async function createGame(_req: PlayerRequest, res: Response) {
+export async function createGame(req: PlayerRequest, res: Response) {
   try {
-    const result = await gameManager.createGame();
+    const language = typeof req.body?.language === 'string' ? req.body.language : 'en';
+    const result = await gameManager.createGame(language);
     return res.status(StatusCodes.CREATED).json(result);
   } catch (error) {
     return handleGameError(res, error, 'Failed to create game');

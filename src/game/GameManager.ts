@@ -3,6 +3,7 @@ import {
   FriendlyWordsConfirmation,
   FriendlyWordsGame,
   FriendlyWordsGameState,
+  FriendlyWordsLanguage,
   FriendlyWordsLivePlay,
   FriendlyWordsPlacement,
   FriendlyWordsPlayer,
@@ -14,7 +15,13 @@ import {
 import { BOARD_SIZE, BINGO_BONUS, MAX_PLAYERS, RACK_SIZE } from './constants';
 import { findPrincipalWord, formatExchangeAction, formatPlayAction } from './notation';
 import { applyPlacementsToBoard, validatePlayGeometry } from './scoring';
-import { createTilePool, drawTiles, getTileValue, serializeRack } from './tileUtils';
+import {
+  createTilePool,
+  drawTiles,
+  getTileValue,
+  normalizeLanguage,
+  serializeRack,
+} from './tileUtils';
 import {
   generateEntityId,
   generateGameCode,
@@ -53,6 +60,7 @@ export type PublicGameView = {
   status: FriendlyWordsGame['status'];
   createdAt: string;
   completedAt: string | null;
+  language: FriendlyWordsLanguage;
   players: PublicPlayer[];
   waitlist: PublicPlayer[];
   turnOrder: string[];
@@ -157,6 +165,10 @@ export class GameManager {
     return player;
   }
 
+  private gameLanguage(game: FriendlyWordsGame): FriendlyWordsLanguage {
+    return normalizeLanguage(game.lang);
+  }
+
   toPublicView(game: FriendlyWordsGame, viewerPlayerId?: string): PublicGameView {
     const view: PublicGameView = {
       id: game.id,
@@ -166,6 +178,7 @@ export class GameManager {
       status: game.status,
       createdAt: game.createdAt.toISOString(),
       completedAt: game.completedAt ? game.completedAt.toISOString() : null,
+      language: this.gameLanguage(game),
       players: game.state.players.map(toPublicPlayer),
       waitlist: game.state.waitlist.map(toPublicPlayer),
       turnOrder: game.state.turnOrder,
@@ -209,7 +222,10 @@ export class GameManager {
     }
   }
 
-  async createGame(): Promise<{ game: PublicGameView; playerId: string; playerToken: string }> {
+  async createGame(
+    languageInput?: string | null
+  ): Promise<{ game: PublicGameView; playerId: string; playerToken: string }> {
+    const language = normalizeLanguage(languageInput);
     let gameCode = generateGameCode();
     for (let attempt = 0; attempt < 20; attempt++) {
       const existing = await this.dao.getFriendlyWordsGameByCode(gameCode);
@@ -223,7 +239,7 @@ export class GameManager {
     const host: FriendlyWordsPlayer = {
       id: playerId,
       token: playerToken,
-      name: 'Player 1',
+      name: language === 'es' ? 'Jugador 1' : 'Player 1',
       ready: false,
       score: 0,
       rack: [],
@@ -246,9 +262,10 @@ export class GameManager {
     const game = await this.dao.createFriendlyWordsGame({
       id,
       gameCode,
-      title: `Game ${gameCode}`,
+      title: language === 'es' ? `Partida ${gameCode}` : `Game ${gameCode}`,
       hostPlayerId: playerId,
       player1: host.name,
+      lang: language,
       state,
     });
 
@@ -267,6 +284,7 @@ export class GameManager {
     if (found.status === 'completed') throw new GameError('Game is already completed', 400);
 
     const game = await this.loadGame(found.id);
+    const language = this.gameLanguage(game);
     const playerId = generatePlayerId();
     const playerToken = generatePlayerToken();
     const openSlot = [1, 2, 3, 4].find(
@@ -276,7 +294,13 @@ export class GameManager {
     const player: FriendlyWordsPlayer = {
       id: playerId,
       token: playerToken,
-      name: openSlot ? `Player ${openSlot}` : `Waitlist ${game.state.waitlist.length + 1}`,
+      name: openSlot
+        ? language === 'es'
+          ? `Jugador ${openSlot}`
+          : `Player ${openSlot}`
+        : language === 'es'
+          ? `Espera ${game.state.waitlist.length + 1}`
+          : `Waitlist ${game.state.waitlist.length + 1}`,
       ready: false,
       score: 0,
       rack: [],
@@ -428,7 +452,8 @@ export class GameManager {
       [order[i], order[j]] = [order[j], order[i]];
     }
 
-    let pool = createTilePool();
+    const language = this.gameLanguage(game);
+    let pool = createTilePool(language);
     for (const player of order) {
       const drawn = drawTiles(pool, RACK_SIZE);
       player.rack = drawn.tiles;
@@ -507,7 +532,7 @@ export class GameManager {
       }
     }
     if (placements.length > 0) {
-      this.assertPlacementsFromRack(player, placements);
+      this.assertPlacementsFromRack(player, placements, this.gameLanguage(game));
     }
 
     let selectedSquare: { row: number; col: number } | null = null;
@@ -558,7 +583,8 @@ export class GameManager {
     if (currentId !== playerId) throw new GameError('Not your turn');
 
     const player = this.requireSeated(game, playerId);
-    this.assertPlacementsFromRack(player, placements);
+    const language = this.gameLanguage(game);
+    this.assertPlacementsFromRack(player, placements, language);
 
     const geometry = validatePlayGeometry(game.state.board, placements);
     if (!geometry.isValid) throw new GameError(geometry.invalidReason || 'Invalid play');
@@ -566,14 +592,20 @@ export class GameManager {
     const principal = findPrincipalWord(game.state.board, placements, geometry.words);
     const isBingo = placements.length === RACK_SIZE;
 
-    const entryTexts = geometry.words.map((w) => w.entry);
-    const recommendations = await this.dao.recommendFriendlyWordsRatings(entryTexts);
+    // Spanish games skip the English entry-based recommendation API and default to 1× (Good).
+    const recommendations =
+      language === 'es'
+        ? ({} as Record<string, string>)
+        : await this.dao.recommendFriendlyWordsRatings(geometry.words.map((w) => w.entry));
 
     const words = geometry.words.map((word) => {
       const recommendedRaw = recommendations[word.entry];
-      const recommendedLabel = isRatingLabel(recommendedRaw)
-        ? recommendedRaw
-        : DEFAULT_RATING_LABEL;
+      const recommendedLabel =
+        language === 'es'
+          ? DEFAULT_RATING_LABEL
+          : isRatingLabel(recommendedRaw)
+            ? recommendedRaw
+            : DEFAULT_RATING_LABEL;
       const isPrincipal =
         word.startRow === principal.startRow &&
         word.startCol === principal.startCol &&
@@ -615,13 +647,17 @@ export class GameManager {
     return this.toPublicView(game, playerId);
   }
 
-  private assertPlacementsFromRack(player: FriendlyWordsPlayer, placements: FriendlyWordsPlacement[]) {
+  private assertPlacementsFromRack(
+    player: FriendlyWordsPlayer,
+    placements: FriendlyWordsPlacement[],
+    language: FriendlyWordsLanguage = 'en'
+  ) {
     const rackCopy = [...player.rack];
     for (const placement of placements) {
       const isBlank = Boolean(placement.isBlank) || placement.letter === '';
       if (isBlank) {
         if (placement.value !== 0) throw new GameError('Blank tiles must have value 0');
-      } else if (placement.value !== getTileValue(placement.letter)) {
+      } else if (placement.value !== getTileValue(placement.letter, language)) {
         throw new GameError('Invalid tile value');
       }
 
@@ -748,7 +784,7 @@ export class GameManager {
     const player = game.state.players[playerIndex];
     const startScore = player.score;
 
-    this.assertPlacementsFromRack(player, confirmation.placements);
+    this.assertPlacementsFromRack(player, confirmation.placements, this.gameLanguage(game));
 
     const rackAtStart = serializeRack(player.rack);
     const action = formatPlayAction(game.state.board, confirmation.placements);
@@ -788,11 +824,12 @@ export class GameManager {
       endScore: player.score,
     };
 
+    const lang = this.gameLanguage(game);
     const playedWords: FriendlyWordsPlayedWord[] = confirmation.words.map((word) => ({
       id: word.id,
       turnId: turn.id,
       entry: word.entry,
-      lang: 'en',
+      lang,
       grossScore: word.grossScore,
       multiplier: String(word.multiplier),
     }));
@@ -808,7 +845,7 @@ export class GameManager {
           playedWordId: word.id,
           playerId: opponentId,
           entry: word.entry,
-          lang: 'en',
+          lang,
           multiplier: String(getRatingMultiplier(rating.ratingLabel)),
           wasUpdated: rating.wasUpdated,
         });
