@@ -186,22 +186,38 @@ async function handleMessage(ws: SocketClient, raw: string) {
   }
 }
 
+const WS_PATHS = new Set(['/ws', '/friendly-words/ws']);
+
+function connectionHandler(ws: SocketClient, _req: IncomingMessage) {
+  send(ws, 'connected', { ok: true });
+
+  ws.on('message', (data) => {
+    void handleMessage(ws, data.toString());
+  });
+
+  ws.on('close', () => {
+    removeSocket(ws);
+  });
+}
+
 export function attachGameWebSocket(server: HttpServer) {
-  const connectionHandler = (ws: SocketClient, _req: IncomingMessage) => {
-    send(ws, 'connected', { ok: true });
-
-    ws.on('message', (data) => {
-      void handleMessage(ws, data.toString());
-    });
-
-    ws.on('close', () => {
-      removeSocket(ws);
-    });
-  };
+  // Use a single WebSocketServer in noServer mode and route upgrade requests
+  // by path ourselves. Attaching multiple WebSocketServer instances to the
+  // same http.Server breaks connections: each registers its own 'upgrade'
+  // listener, and the instance whose path doesn't match calls abortHandshake()
+  // on a socket the other instance may have already upgraded, destroying it.
+  const wss = new WebSocketServer({ noServer: true });
 
   gameManager.setBroadcasters(broadcast, sendToPlayer);
 
-  for (const path of ['/ws', '/friendly-words/ws']) {
-    new WebSocketServer({ server, path }).on('connection', connectionHandler);
-  }
+  server.on('upgrade', (req, socket, head) => {
+    const pathname = req.url ? req.url.split('?')[0] : '';
+    if (!WS_PATHS.has(pathname)) {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      connectionHandler(ws as SocketClient, req);
+    });
+  });
 }
