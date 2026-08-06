@@ -10,5 +10,5 @@ attachGameWebSocket(server);
 
 server.listen(port, () => {
   console.log(`Friendly Words API listening on port ${port}`);
-  console.log(`WebSocket endpoint: ws://localhost:${port}/ws`);
+  console.log(`WebSocket endpoint: ${process.env.WS_URL || `ws://localhost:${port}/ws`}`);
 });

@@ -1,17 +1,11 @@
 services:
   app:
     image: ${FRIENDLY_WORDS_IMAGE:-friendly-words:latest}
-    build:
-      context: .
-      dockerfile: Dockerfile
-      additional_contexts:
-        cruzi-models: ../cruzi-models
-        cruzi-db: ../cruzi-db
     environment:
       DATABASE_URL: ${DATABASE_URL}
       PORT: 3001
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "80:3001"
+      - "8080:3001"
     restart: unless-stopped

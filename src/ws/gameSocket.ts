@@ -187,11 +187,7 @@ async function handleMessage(ws: SocketClient, raw: string) {
 }
 
 export function attachGameWebSocket(server: HttpServer) {
-  const wss = new WebSocketServer({ server, path: '/ws' });
-
-  gameManager.setBroadcasters(broadcast, sendToPlayer);
-
-  wss.on('connection', (ws: SocketClient, _req: IncomingMessage) => {
+  const connectionHandler = (ws: SocketClient, _req: IncomingMessage) => {
     send(ws, 'connected', { ok: true });
 
     ws.on('message', (data) => {
@@ -201,7 +197,11 @@ export function attachGameWebSocket(server: HttpServer) {
     ws.on('close', () => {
       removeSocket(ws);
     });
-  });
+  };
 
-  return wss;
+  gameManager.setBroadcasters(broadcast, sendToPlayer);
+
+  for (const path of ['/ws', '/friendly-words/ws']) {
+    new WebSocketServer({ server, path }).on('connection', connectionHandler);
+  }
 }

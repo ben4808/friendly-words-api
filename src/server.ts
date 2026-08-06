@@ -8,12 +8,19 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(
   cors({
-    origin: [
-      'http://localhost:3000',
-      'http://localhost:5173',
-      'http://localhost:5174',
-      'http://127.0.0.1:5173',
-    ],
+    origin: (origin, callback) => {
+      if (
+        !origin ||
+        /^http:\/\/localhost:\d+$/.test(origin) ||
+        /^http:\/\/127\.0\.0\.1:\d+$/.test(origin) ||
+        origin === 'https://friendlywords.com' || 
+        origin === 'https://cruzi.net'
+      ) {
+        callback(null, true);
+      } else {
+        callback(new Error(`Origin ${origin} not allowed by CORS`));
+      }
+    },
     credentials: true,
   })
 );
@@ -22,6 +29,6 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
 
-app.use('/api', BaseRouter);
+app.use(['/api', '/friendly-words/api'], BaseRouter);
 
 export default app;
