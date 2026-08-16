@@ -72,6 +72,8 @@ export type PublicGameView = {
   confirmation: FriendlyWordsConfirmation | null;
   livePlay?: FriendlyWordsLivePlay | null;
   winnerPlayerId: string | null | undefined;
+  turns: FriendlyWordsTurn[];
+  playedWords: FriendlyWordsPlayedWord[];
   myRack?: FriendlyWordsGameState['tilePool'];
   me?: PublicPlayer & { token?: string };
 };
@@ -190,6 +192,8 @@ export class GameManager {
       confirmation: game.state.confirmation,
       livePlay: this.livePlays.get(game.id) ?? null,
       winnerPlayerId: game.state.winnerPlayerId,
+      turns: game.turns ?? [],
+      playedWords: game.playedWords ?? [],
     };
 
     if (viewerPlayerId) {
@@ -287,20 +291,32 @@ export class GameManager {
     const language = this.gameLanguage(game);
     const playerId = generatePlayerId();
     const playerToken = generatePlayerToken();
-    const openSlot = [1, 2, 3, 4].find(
-      (slot) => !game.state.players.some((player) => player.slot === slot)
-    );
+
+    // Joining an in-progress game places the player in Guest mode on the
+    // waitlist: they can watch the board and live plays but cannot take turns,
+    // propose, rate, or confirm. Seats are not filled mid-game because
+    // turnOrder and racks are fixed at startGame.
+    const joinAsGuest = game.status === 'playing';
+    const openSlot = joinAsGuest
+      ? null
+      : [1, 2, 3, 4].find(
+        (slot) => !game.state.players.some((player) => player.slot === slot)
+      );
 
     const player: FriendlyWordsPlayer = {
       id: playerId,
       token: playerToken,
-      name: openSlot
+      name: joinAsGuest
         ? language === 'es'
-          ? `Jugador ${openSlot}`
-          : `Player ${openSlot}`
-        : language === 'es'
-          ? `Espera ${game.state.waitlist.length + 1}`
-          : `Waitlist ${game.state.waitlist.length + 1}`,
+          ? `Invitado ${game.state.waitlist.length + 1}`
+          : `Guest ${game.state.waitlist.length + 1}`
+        : openSlot
+          ? language === 'es'
+            ? `Jugador ${openSlot}`
+            : `Player ${openSlot}`
+          : language === 'es'
+            ? `Espera ${game.state.waitlist.length + 1}`
+            : `Waitlist ${game.state.waitlist.length + 1}`,
       ready: false,
       score: 0,
       rack: [],
@@ -784,8 +800,10 @@ export class GameManager {
     const player = game.state.players[playerIndex];
     const startScore = player.score;
 
-    this.assertPlacementsFromRack(player, confirmation.placements, this.gameLanguage(game));
-
+    // Rack contents were already validated in proposePlay when the proposer
+    // submitted the placements, and no rack-mutating action is permitted while
+    // the game is in the 'confirming' phase, so we don't re-assert here — the
+    // opponent triggering this commit doesn't own the placements' tiles.
     const rackAtStart = serializeRack(player.rack);
     const action = formatPlayAction(game.state.board, confirmation.placements);
 

@@ -13,8 +13,9 @@ app.use(
         !origin ||
         /^http:\/\/localhost:\d+$/.test(origin) ||
         /^http:\/\/127\.0\.0\.1:\d+$/.test(origin) ||
-        origin === 'https://friendlywords.com' || 
-        origin === 'https://cruzi.net'
+        origin === 'https://friendlywords.com' ||
+        origin === 'https://cruzi.net' ||
+        origin === 'https://friendlywords.cruzi.net'
       ) {
         callback(null, true);
       } else {
@@ -29,6 +30,6 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
 
-app.use(['/api', '/friendly-words/api'], BaseRouter);
+app.use('/api', BaseRouter);
 
 export default app;
