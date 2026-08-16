@@ -54,7 +54,7 @@ export type PublicPlayer = Omit<FriendlyWordsPlayer, 'token' | 'rack'> & {
 
 export type PublicGameView = {
   id: string;
-  gameCode: string;
+  gameCode: string | null;
   title: string;
   hostPlayerId: string;
   status: FriendlyWordsGame['status'];
@@ -136,6 +136,7 @@ export class GameManager {
       turns: game.turns,
       playedWords: game.playedWords,
     };
+    game.gameCode = updated.gameCode;
     this.cache.set(game.id, merged);
     return merged;
   }
@@ -230,13 +231,6 @@ export class GameManager {
     languageInput?: string | null
   ): Promise<{ game: PublicGameView; playerId: string; playerToken: string }> {
     const language = normalizeLanguage(languageInput);
-    let gameCode = generateGameCode();
-    for (let attempt = 0; attempt < 20; attempt++) {
-      const existing = await this.dao.getFriendlyWordsGameByCode(gameCode);
-      if (!existing) break;
-      gameCode = generateGameCode();
-    }
-
     const playerId = generatePlayerId();
     const playerToken = generatePlayerToken();
     const id = generateGameId();
@@ -263,15 +257,28 @@ export class GameManager {
       winnerPlayerId: null,
     };
 
-    const game = await this.dao.createFriendlyWordsGame({
-      id,
-      gameCode,
-      title: language === 'es' ? `Partida ${gameCode}` : `Game ${gameCode}`,
-      hostPlayerId: playerId,
-      player1: host.name,
-      lang: language,
-      state,
-    });
+    let game: FriendlyWordsGame | null = null;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const gameCode = generateGameCode();
+      try {
+        game = await this.dao.createFriendlyWordsGame({
+          id,
+          gameCode,
+          title: language === 'es' ? `Partida ${gameCode}` : `Game ${gameCode}`,
+          hostPlayerId: playerId,
+          player1: host.name,
+          lang: language,
+          state,
+        });
+        break;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/game code already in use|ux_friendly_words_game_code/i.test(message)) {
+          throw error;
+        }
+      }
+    }
+    if (!game) throw new GameError('Could not assign a unique game code', 500);
 
     this.cache.set(game.id, game);
     const view = this.toPublicView(game, playerId);
@@ -281,13 +288,27 @@ export class GameManager {
   }
 
   async joinGame(
-    gameCode: string
+    gameCode: string,
+    existingPlayerId?: string,
+    existingPlayerToken?: string
   ): Promise<{ game: PublicGameView; playerId: string; playerToken: string }> {
     const found = await this.dao.getFriendlyWordsGameByCode(gameCode);
     if (!found) throw new GameError('Game not found', 404);
     if (found.status === 'completed') throw new GameError('Game is already completed', 400);
 
     const game = await this.loadGame(found.id);
+
+    if (existingPlayerId && existingPlayerToken) {
+      const existing =
+        game.state.players.find((p) => p.id === existingPlayerId) ||
+        game.state.waitlist.find((p) => p.id === existingPlayerId);
+      if (existing && existing.token === existingPlayerToken) {
+        const view = this.toPublicView(game, existing.id);
+        view.me = { ...toPublicPlayer(existing), token: existing.token };
+        return { game: view, playerId: existing.id, playerToken: existing.token };
+      }
+    }
+
     const language = this.gameLanguage(game);
     const playerId = generatePlayerId();
     const playerToken = generatePlayerToken();
@@ -327,6 +348,13 @@ export class GameManager {
       game.state.players.push(player);
     } else {
       game.state.waitlist.push(player);
+    }
+
+    const hostPresent = [...game.state.players, ...game.state.waitlist].some(
+      (p) => p.id === game.hostPlayerId
+    );
+    if (!hostPresent) {
+      game.hostPlayerId = player.id;
     }
 
     await this.persist(game);
@@ -411,8 +439,19 @@ export class GameManager {
     }
 
     if (game.state.players.length === 0 && game.state.waitlist.length === 0) {
-      game.status = 'completed';
-      game.completedAt = new Date();
+      // Keep the join code so someone can come back later. The code is only
+      // released when the game actually ends, or stolen after 6 months.
+      if (game.status === 'playing') {
+        game.status = 'lobby';
+        game.state.gamePhase = 'ready';
+        game.state.turnOrder = [];
+        game.state.currentPlayerIndex = 0;
+        game.state.turnNumber = 0;
+        game.state.tilePool = [];
+        game.state.board = emptyBoard();
+        game.state.confirmation = null;
+        game.state.winnerPlayerId = null;
+      }
       await this.persist(game);
       this.cache.delete(game.id);
       return null;
@@ -978,6 +1017,7 @@ export class GameManager {
     game.state.gamePhase = 'gameOver';
     game.status = 'completed';
     game.completedAt = new Date();
+    game.gameCode = null;
   }
 
   async returnToLobby(gameId: string, playerId: string): Promise<PublicGameView> {

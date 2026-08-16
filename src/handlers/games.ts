@@ -24,7 +24,7 @@ export async function joinGame(req: PlayerRequest, res: Response) {
     if (!/^\d{4}$/.test(code)) {
       return res.status(StatusCodes.BAD_REQUEST).json({ message: 'Game code must be 4 digits' });
     }
-    const result = await gameManager.joinGame(code);
+    const result = await gameManager.joinGame(code, req.playerId, req.playerToken);
     return res.status(StatusCodes.OK).json(result);
   } catch (error) {
     return handleGameError(res, error, 'Failed to join game');
