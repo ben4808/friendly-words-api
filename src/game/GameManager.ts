@@ -1,6 +1,7 @@
 import CruziDao from 'cruzi-db';
 import {
   FriendlyWordsConfirmation,
+  FriendlyWordsEndGameBonus,
   FriendlyWordsGame,
   FriendlyWordsGameState,
   FriendlyWordsLanguage,
@@ -20,6 +21,7 @@ import {
   drawTiles,
   getTileValue,
   normalizeLanguage,
+  formatRackTiles,
   serializeRack,
 } from './tileUtils';
 import {
@@ -72,6 +74,7 @@ export type PublicGameView = {
   confirmation: FriendlyWordsConfirmation | null;
   livePlay?: FriendlyWordsLivePlay | null;
   winnerPlayerId: string | null | undefined;
+  endGameBonus?: FriendlyWordsEndGameBonus | null;
   turns: FriendlyWordsTurn[];
   playedWords: FriendlyWordsPlayedWord[];
   myRack?: FriendlyWordsGameState['tilePool'];
@@ -193,6 +196,7 @@ export class GameManager {
       confirmation: game.state.confirmation,
       livePlay: this.livePlays.get(game.id) ?? null,
       winnerPlayerId: game.state.winnerPlayerId,
+      endGameBonus: game.state.endGameBonus ?? null,
       turns: game.turns ?? [],
       playedWords: game.playedWords ?? [],
     };
@@ -255,6 +259,7 @@ export class GameManager {
       gamePhase: 'ready',
       confirmation: null,
       winnerPlayerId: null,
+      endGameBonus: null,
     };
 
     let game: FriendlyWordsGame | null = null;
@@ -526,6 +531,7 @@ export class GameManager {
     game.state.gamePhase = 'playing';
     game.state.confirmation = null;
     game.state.winnerPlayerId = null;
+    game.state.endGameBonus = null;
     game.status = 'playing';
 
     this.clearLivePlay(game.id, false);
@@ -557,11 +563,11 @@ export class GameManager {
     }
   ): Promise<FriendlyWordsLivePlay | null> {
     const game = await this.loadGame(gameId);
-    if (game.status !== 'playing') throw new GameError('Game is not in progress');
-    if (game.state.gamePhase !== 'playing') throw new GameError('Cannot preview during confirmation');
+    // Stale previews after submit / game over are common; don't error the client.
+    if (game.status !== 'playing' || game.state.gamePhase !== 'playing') return null;
 
     const currentId = game.state.turnOrder[game.state.currentPlayerIndex];
-    if (currentId !== playerId) throw new GameError('Not your turn');
+    if (currentId !== playerId) return null;
 
     const player = this.requireSeated(game, playerId);
     const rawPlacements = Array.isArray(update.placements) ? update.placements : [];
@@ -999,15 +1005,29 @@ export class GameManager {
   private finalizeGame(game: FriendlyWordsGame) {
     // Transfer remaining tile values from unfinished racks
     const emptied = game.state.players.find((p) => p.rack.length === 0);
+    const leftoverTiles: FriendlyWordsGameState['tilePool'] = [];
+    let points = 0;
     if (emptied) {
       for (const player of game.state.players) {
         if (player.id === emptied.id) continue;
+        leftoverTiles.push(...player.rack);
         const leftover = player.rack.reduce((sum, tile) => sum + tile.value, 0);
+        points += leftover;
         player.score -= leftover;
         emptied.score += leftover;
         player.rack = [];
       }
     }
+
+    game.state.endGameBonus =
+      emptied && points > 0
+        ? {
+            playerId: emptied.id,
+            playerName: emptied.name,
+            points,
+            tiles: formatRackTiles(leftoverTiles),
+          }
+        : null;
 
     let winner = game.state.players[0];
     for (const player of game.state.players) {
@@ -1043,6 +1063,7 @@ export class GameManager {
     game.state.gamePhase = 'ready';
     game.state.confirmation = null;
     game.state.winnerPlayerId = null;
+    game.state.endGameBonus = null;
 
     this.clearLivePlay(gameId, false);
     await this.persist(game);

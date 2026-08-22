@@ -82,14 +82,19 @@ export const drawTiles = (
   return { tiles, remainingPool };
 };
 
-/** Serialize rack letters alphabetically, with blanks (`?`) last. */
-export const serializeRack = (rack: FriendlyWordsTile[]): string => {
-  return rack
+const sortedRackLetters = (rack: FriendlyWordsTile[]): string[] =>
+  rack
     .map((tile) => (tile.letter === '' ? '?' : tile.letter.toUpperCase()))
     .sort((a, b) => {
       if (a === '?') return 1;
       if (b === '?') return -1;
       return a.localeCompare(b);
-    })
-    .join('');
-};
+    });
+
+/** Serialize rack letters alphabetically, with blanks (`?`) last. */
+export const serializeRack = (rack: FriendlyWordsTile[]): string =>
+  sortedRackLetters(rack).join('');
+
+/** Human-readable leftover tiles for end-game toasts (`Q X J`). */
+export const formatRackTiles = (rack: FriendlyWordsTile[]): string =>
+  sortedRackLetters(rack).join(' ');
